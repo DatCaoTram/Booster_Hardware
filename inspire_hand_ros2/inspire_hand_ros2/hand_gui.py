@@ -4,12 +4,16 @@
   python -m inspire_hand_ros2.hand_gui --serial COM5         # USB-RS485 adapter, no ROS needed
   ros2 run inspire_hand_ros2 hand_gui --ns /left_hand         # through the ROS2 driver or bridge
 
+Add --rokoko to any of these to drive the hand from a Rokoko Smartglove (Rokoko Studio's
+Custom live stream, UDP 14043): tick "Follow glove", calibrate open and fist once.
+
 Only the slider you move is sent (other fingers hold), so touching one finger never
 makes the rest jump.
 """
 import argparse
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -130,7 +134,7 @@ class RosBackend:
 class HandPanel:
     PERIOD_MS = 50
 
-    def __init__(self, root, backend):
+    def __init__(self, root, backend, glove=None):
         self.root, self.backend = root, backend
         self.targets = [tk.IntVar(value=1000) for _ in range(6)]
         self.sent = [None] * 6        # last target sent (or synced) per DOF
@@ -188,6 +192,18 @@ class HandPanel:
 
         ttk.Label(frame, textvariable=self.status, wraplength=700).grid(
             row=9, column=0, columnspan=4, sticky="w", pady=(10, 0))
+
+        self.glove, self.note_until = glove, 0.0
+        self.follow = tk.BooleanVar(value=False)
+        self.glove_status = tk.StringVar(value="")
+        if glove:
+            row = ttk.Frame(frame)
+            row.grid(row=10, column=0, columnspan=4, sticky="w", pady=(10, 0))
+            ttk.Label(row, text="Rokoko glove:").pack(side="left", padx=(0, 6))
+            ttk.Checkbutton(row, text="Follow glove", variable=self.follow).pack(side="left", padx=2)
+            ttk.Button(row, text="Calibrate open", command=lambda: self.calibrate("open")).pack(side="left", padx=2)
+            ttk.Button(row, text="Calibrate fist", command=lambda: self.calibrate("closed")).pack(side="left", padx=2)
+            ttk.Label(row, textvariable=self.glove_status).pack(side="left", padx=8)
         root.after(0, self._loop)
 
     # -- user actions -------------------------------------------------------------
@@ -203,12 +219,21 @@ class HandPanel:
                 self.dirty.add(i)
 
     def preset(self, name):
+        self.follow.set(False)
         for delay, angles in PRESETS[name]:
             self.root.after(delay, self._apply, angles)
 
     def stop(self):
+        self.follow.set(False)
         if self.actual is not None:
             self._apply(self.actual)
+
+    def calibrate(self, pose):
+        try:
+            self.glove_status.set(self.glove.calibrate(pose))
+        except RuntimeError as e:
+            self.glove_status.set(str(e))
+        self.note_until = time.monotonic() + 2.5
 
     def clear_errors(self):
         try:
@@ -219,13 +244,28 @@ class HandPanel:
     def close(self):
         try:
             self.backend.close()
+            if self.glove:
+                self.glove.close()
         finally:
             self.root.destroy()
 
     # -- I/O loop -----------------------------------------------------------------
 
+    def _follow_glove(self):
+        target = self.glove.update()
+        if time.monotonic() > self.note_until:  # let a calibration message stay up for a moment
+            self.glove_status.set(self.glove.status())
+        if target is None or not self.follow.get():
+            return
+        for i, t in enumerate(target):
+            if abs(t - self.targets[i].get()) >= 5:  # deadband keeps the bus quiet when the hand is still
+                self.targets[i].set(t)
+                self.dirty.add(i)
+
     def _loop(self):
         try:
+            if self.glove:
+                self._follow_glove()
             settings = (self.speed.get(), self.force.get())
             if settings != self.sent_settings:
                 self.backend.send_speed([settings[0]] * 6)
@@ -262,7 +302,16 @@ def main(argv=None):
     ap.add_argument("--id", type=int, default=1, help="hand ID (default 1)")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--ns", default="/left_hand", help="ROS2 namespace of the driver (default /left_hand)")
+    ap.add_argument("--rokoko", action="store_true", help="follow a Rokoko Smartglove from Rokoko Studio's stream")
+    ap.add_argument("--glove", choices=("left", "right"), default="left", help="which glove drives the hand")
+    ap.add_argument("--rokoko-port", type=int, default=14043, help="UDP port Rokoko Studio streams to")
+    ap.add_argument("--calibration", default="~/.rokoko_rh56_calibration.json", help="glove calibration file")
     args, ros_args = ap.parse_known_args(argv)
+
+    glove = None
+    if args.rokoko:
+        from .rokoko import GloveTeleop
+        glove = GloveTeleop(args.glove, args.rokoko_port, calibration_file=args.calibration)
 
     if args.sim:
         backend = DirectBackend(rh56.RH56(SimulatedHand(args.id), args.id), "simulator")
@@ -275,7 +324,7 @@ def main(argv=None):
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     root = tk.Tk()
-    HandPanel(root, backend)
+    HandPanel(root, backend, glove)
     root.mainloop()
 
 

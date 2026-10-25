@@ -6,7 +6,8 @@
 |---|---|
 | `driver` | Talks to the hand over RS485 (USB-RS485 adapter) and exposes it as ROS 2 topics. |
 | `booster_bridge` | Same command topics, forwarded to the T1's own hand control (`/booster_rpc_service`). Use it only if the hand is plugged into the robot's hand port. |
-| `hand_gui` | Manual control panel: a slider per finger, gestures, speed/force, live feedback. Works through ROS 2, or straight to the hand over serial (no ROS, works on Windows), or against a simulator. |
+| `hand_gui` | Manual control panel: a slider per finger, gestures, speed/force, live feedback. Works through ROS 2, or straight to the hand over serial (no ROS, works on Windows), or against a simulator. Add `--rokoko` to drive it from a Rokoko Smartglove. |
+| `rokoko_teleop` | Follows a Rokoko Smartglove (Rokoko Studio's live stream) and publishes `cmd_angle`. See [section 7](#7-rokoko-smartglove-teleoperation). |
 
 The protocol code (`rh56.py`) follows the RH56 manual V1.0.9 and is tested against the manual's worked examples byte for byte (`test/test_rh56.py`).
 
@@ -122,9 +123,61 @@ DOF order everywhere: little, ring, middle, index, thumb bend, thumb rotate. Raw
 
 Tuning lives in [config/left_hand.yaml](inspire_hand_ros2/config/left_hand.yaml): default speed/force, joint name prefix, and the raw↔radian mapping. The default mapping is a linear flexion angle from the manual's ranges (fingers 19°–176.7°, thumb bend −13°–53.6°, thumb rotation 90°–165°). Change `joint_open_rad` / `joint_closed_rad` to match your URDF.
 
-## 7. Limits and what's not verified
+## 7. Rokoko Smartglove teleoperation
 
-- Tested here: the protocol against the manual's example frames, the full stack against the built-in simulator, the GUI against the simulator, and the driver/bridge logic against a stubbed `rclpy`. **Not yet run on real ROS 2 or on the real hand.** First real run: bench test (step 3), then `simulate:=true` on the T1, then the real hand.
+The robot hand follows your glove. The glove goes to Rokoko Studio as usual. Studio streams the finger bones over UDP, and our code turns finger curl into RH56 targets. Only the curl is used: turning or moving your whole hand doesn't move the robot's fingers.
+
+| Robot DOF | Measured from |
+|---|---|
+| little, ring, middle, index | the finger's three joints (knuckle, middle, tip) |
+| thumb bend | the thumb's middle and tip joints |
+| thumb rotate | the thumb's base joint (swinging across the palm) |
+
+**1. Turn on streaming in Rokoko Studio.** Rokoko lists live streaming as a Studio Plus (or higher) feature.
+1. Open the project and scene with your glove actor.
+2. Open the **Streaming** panel on the right, find **Custom**, and click its wrench icon.
+3. Set **Forward IP** to the machine running the bridge (`127.0.0.1` if it's this PC, or the T1's IP), port **14043**, format **JSON**. LZ4 also works after `pip install lz4`.
+4. Click **Activate**.
+
+**2a. Test on this PC with the hand on COM4 (no ROS):**
+
+```bash
+cd G:\robothand\inspire_hand_ros2; python -m inspire_hand_ros2.hand_gui --serial COM4 --rokoko
+```
+
+Allow Python through Windows Firewall if it asks. When the glove row says `left glove of <actor>`:
+1. Hold your hand flat with the fingers straight and the thumb alongside, then click **Calibrate open**.
+2. Make a fist with the thumb folded across the fingers, then click **Calibrate fist**.
+3. Tick **Follow glove**.
+
+**Stop** or any gesture button stops following. The calibration is saved to `~/.rokoko_rh56_calibration.json` and reloaded next time. Use `--glove right` to drive the hand with a right glove.
+
+**2b. On the T1.** Point Studio's Forward IP at the T1, then:
+
+```bash
+ros2 launch inspire_hand_ros2 hand.launch.py port:=/dev/serial/by-id/usb-XXXX rokoko:=true
+```
+```bash
+ros2 service call /left_hand/calibrate_open std_srvs/srv/Trigger
+```
+```bash
+ros2 service call /left_hand/calibrate_closed std_srvs/srv/Trigger
+```
+```bash
+ros2 service call /left_hand/enable std_srvs/srv/SetBool "{data: false}"
+```
+
+The last command pauses following; `{data: true}` resumes it. Or copy the calibration file you made on the PC to the T1's home folder. Settings (`glove_side`, `udp_port`, `smoothing`, `calibration_file`) are in [config/left_hand.yaml](inspire_hand_ros2/config/left_hand.yaml).
+
+If the robot doesn't follow, check the status line or the node log:
+- `waiting for Rokoko Studio`: no packets are arriving. Check the Forward IP, the port and the firewall.
+- `stream has no left glove`: wrong glove side or actor.
+- `not calibrated yet`: it works, but uses rough default ranges until you calibrate.
+
+## 8. Limits and what's not verified
+
+- Tested here: the protocol against the manual's example frames, the full stack against the built-in simulator, the GUI against the simulator, and the driver/bridge/teleop node logic against a stubbed `rclpy`. The GUI has connected to the real hand on Windows. **The ROS 2 nodes haven't run on real ROS 2 yet.** First real run: bench test (step 3), then `simulate:=true` on the T1, then the real hand.
+- Glove teleop is tested with synthetic Rokoko Studio frames (same JSON layout and reference T-pose as Rokoko's own Blender plugin), not yet with a live glove. Thumb rotation is the roughest mapping. Calibrate before relying on it.
 - One hand per serial port. For two hands, use two adapters (and give each its own namespace and `joint_prefix`).
 - The Booster bridge is written from Booster's SDK headers (`b1_loco_api.hpp`) and their ROS 2 RPC example. It hasn't been run against a T1.
 - Force readings depend on the hand's force-sensor calibration. Recalibrate from the Inspire PC software with the hand unloaded if forces look off at rest.
